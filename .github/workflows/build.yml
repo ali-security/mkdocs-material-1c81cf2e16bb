@@ -20,13 +20,12 @@
 
 name: build
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-  release:
-    types:
-      - published
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: pytest -k expression selecting a subset of the wheel tests (empty runs all)
+        required: false
+        default: ''
 
 env:
   NODE_VERSION: 24.x
@@ -38,6 +37,7 @@ permissions:
 jobs:
   npm-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
 
       - name: Checkout repository
@@ -66,6 +66,7 @@ jobs:
 
   npm-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
 
       - name: Checkout repository
@@ -92,9 +93,7 @@ jobs:
 
   python:
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -111,8 +110,62 @@ jobs:
       - name: Set up Python dependencies
         run: pip install --upgrade build twine
 
+      - name: Set up Node.js runtime
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Node.js dependency cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          key: ${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          path: node_modules
+
+      - name: Set up Node.js dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: npm install
+
+      # Regenerate the prebuilt theme assets in material/ from src/, so that the
+      # minified bundles shipped in the distributions carry the patched sources.
+      # The browserslist query in .browserslistrc ("last 4 years") moves with
+      # the clock, so pin it to the window of the 9.7.6 release to keep the
+      # stylesheets reproducible and their browser support unchanged. Files the
+      # build only rewrote with different line endings (icon licenses copied
+      # from node_modules) are restored to their checked-in form.
+      - name: Build theme assets
+        env:
+          BROWSERSLIST: since 2022-03-19
+        run: |
+          npm run build
+          git ls-files -m -z -- material | while IFS= read -r -d '' file; do
+            if git diff --quiet -- "$file"; then
+              git checkout -- "$file"
+            fi
+          done
+          git status --porcelain
+
       - name: Build Python package
-        run: python -m build
+        run: |
+          echo "hatchling==1.29.0" > "${RUNNER_TEMP}/build-constraints.txt"
+          PIP_CONSTRAINT="${RUNNER_TEMP}/build-constraints.txt" python -m build
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Test built wheel
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          python -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install dist/mkdocs_material-*.whl pytest
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/venv/bin/python" -m pytest -v -rA -p no:cacheprovider \
+            "${GITHUB_WORKSPACE}/.github/seal/test_wheel.py" ${TEST_FILTER:+-k "$TEST_FILTER"}
 
       - name: Publish Python package
         if: github.event_name == 'release'
@@ -120,6 +173,9 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: false
     steps:
 
       - name: Checkout repository
